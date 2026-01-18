@@ -1,6 +1,6 @@
 package main
 
-import "github.com/GouthamJosh/autofilterbot/cmd"
+import "github.com/Jisin0/autofilterbot/cmd"
 
 func main() {
 	cmd.Execute()
