@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"time"
@@ -31,19 +32,18 @@ type Core struct {
 	additionalURLsCount int
 }
 
-// extendedHandler returns a handlers.Response that calls
-
 // RunAppOptions wraps command-line arguments for app startup.
 type RunAppOptions struct {
 	MongodbURI         string
 	LogLevel           string
 	BotToken           string
 	DisableConsoleLogs bool
+	Port               string
 }
 
 // Run starts the application and initializes core components.
 func Run(opts RunAppOptions) {
-	err := godotenv.Load(".env") // config.env is supported bcuz other repos use it for some reason
+	err := godotenv.Load(".env")
 	if err != nil {
 		fmt.Println("ERROR: load variables from .env file failed", err)
 	}
@@ -55,6 +55,24 @@ func Run(opts RunAppOptions) {
 
 	log.Initialize(logLevel, opts.DisableConsoleLogs)
 	logger := log.Logger()
+
+	// ---- Render HTTP keep-alive server ----
+	if opts.Port != "" {
+		go func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte("ok"))
+			})
+
+			addr := "0.0.0.0:" + opts.Port
+			logger.Info("starting http server", zap.String("addr", addr))
+
+			if err := http.ListenAndServe(addr, mux); err != nil {
+				logger.Fatal("http server failed", zap.Error(err))
+			}
+		}()
+	}
 
 	botToken := opts.BotToken
 	if s := os.Getenv("BOT_TOKEN"); s != "" {
@@ -70,7 +88,7 @@ func Run(opts RunAppOptions) {
 		logger.Fatal("create bot failed", zap.Error(err))
 	}
 
-	ctx, cancel := context.WithCancel(context.Background()) // all background jobs (tickers) must use this ctx
+	ctx, cancel := context.WithCancel(context.Background())
 
 	mongodbUri := opts.MongodbURI
 	if s := os.Getenv("MONGODB_URI"); s != "" {
@@ -85,8 +103,7 @@ func Run(opts RunAppOptions) {
 	collectionName := os.Getenv("COLLECTION_NAME")
 
 	var additionalUri []string
-
-	for i := 1; i <= 5; i++ { // attempts to fetch MONGODB_URI1 to MONGODB_URI5. //TODO: remove hardcoded limit after testing
+	for i := 1; i <= 5; i++ {
 		if s := os.Getenv(fmt.Sprintf("MONGODB_URI%d", i)); s != "" {
 			additionalUri = append(additionalUri, s)
 		}
@@ -99,7 +116,6 @@ func Run(opts RunAppOptions) {
 	}
 
 	db, err := mongo.NewClient(ctx, mongodbUri, logger, mongoOpts)
-
 	if err != nil {
 		logger.Fatal("database setup failed", zap.Error(err))
 	}
@@ -151,14 +167,18 @@ func Run(opts RunAppOptions) {
 	err = updater.StartPolling(bot, &ext.PollingOpts{
 		DropPendingUpdates: true,
 		GetUpdatesOpts: &gotgbot.GetUpdatesOpts{
-			AllowedUpdates: []string{"message", "channel_post", "inline_query", "chosen_inline_result", "callback_query", "chat_join_request"},
+			AllowedUpdates: []string{
+				"message",
+				"channel_post",
+				"inline_query",
+				"chosen_inline_result",
+				"callback_query",
+				"chat_join_request",
+			},
 		},
 	})
 	if err != nil {
-		logger.Fatal(
-			"failed to start polling updates",
-			zap.Error(err),
-		)
+		logger.Fatal("failed to start polling updates", zap.Error(err))
 	}
 
 	logger.Info(fmt.Sprintf("@%s started successfully !", bot.Username))
@@ -172,26 +192,36 @@ func Run(opts RunAppOptions) {
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)
 
-	s := <-c // wait until an interrupt signal is received
+	s := <-c
 	logger.Info("stopping app: interrupt signal received", zap.Any("signal", s))
 
 	updater.Stop()
-
-	cancel() // autodelete & mongo updater should stop with this
+	cancel()
 	_app.DB.Shutdown()
 }
 
-// AuthAdmin reports whether the user who sent the message is an admin or otherwise sends a warn message.
+// ------------------- helpers unchanged -------------------
+
 func (core *Core) AuthAdmin(ctx *ext.Context) bool {
 	switch {
 	case ctx.Message != nil:
 		if !containsI64(_app.Admins, ctx.Message.From.Id) {
-			ctx.Message.Reply(core.Bot, "<b>𝖮𝗇𝗅𝗒 𝖺𝗇 𝖺𝖽𝗆𝗂𝗇 𝖼𝖺𝗇 𝗎𝗌𝖾 𝗍𝗁𝖺𝗍 𝖼𝗈𝗆𝗆𝖺𝗇𝖽, 𝖯𝖾𝖺𝗌𝖺𝗇𝗍❗</b>", &gotgbot.SendMessageOpts{ParseMode: gotgbot.ParseModeHTML})
+			ctx.Message.Reply(
+				core.Bot,
+				"<b>𝖮𝗇𝗅𝗒 𝖺𝗇 𝖺𝖽𝗆𝗂𝗇 𝖼𝖺𝗇 𝗎𝗌𝖾 𝗍𝗁𝖺𝗍 𝖼𝗈𝗆𝗆𝖺𝗇𝖽, 𝖯𝖾𝖺𝗌𝖺𝗇𝗍❗</b>",
+				&gotgbot.SendMessageOpts{ParseMode: gotgbot.ParseModeHTML},
+			)
 			return false
 		}
 	case ctx.CallbackQuery != nil:
 		if !containsI64(_app.Admins, ctx.CallbackQuery.From.Id) {
-			ctx.CallbackQuery.Answer(_app.Bot, &gotgbot.AnswerCallbackQueryOpts{Text: "𝖮𝗇𝗅𝗒 𝖺𝗇 𝖺𝖽𝗆𝗂𝗇 𝖼𝖺𝗇 𝗎𝗌𝖾 𝗍𝗁𝖺𝗍 𝖼𝗈𝗆𝗆𝖺𝗇𝖽, 𝖯𝖾𝖺𝗌𝖺𝗇𝗍❗", ShowAlert: true})
+			ctx.CallbackQuery.Answer(
+				_app.Bot,
+				&gotgbot.AnswerCallbackQueryOpts{
+					Text:      "𝖮𝗇𝗅𝗒 𝖺𝗇 𝖺𝖽𝗆𝗂𝗇 𝖼𝖺𝗇 𝗎𝗌𝖾 𝗍𝗁𝖺𝗍 𝖼𝗈𝗆𝗆𝖺𝗇𝖽, 𝖯𝖾𝖺𝗌𝖺𝗇𝗍❗",
+					ShowAlert: true,
+				},
+			)
 			return false
 		}
 	default:
@@ -202,17 +232,14 @@ func (core *Core) AuthAdmin(ctx *ext.Context) bool {
 	return true
 }
 
-// RefreshConfig refetches the bot configs from db.
 func (core *Core) RefreshConfig() {
 	c, err := core.DB.GetConfig(core.Bot.Id)
 	if err != nil {
 		core.Log.Error("failed to refresh configs", zap.Error(err))
 	}
-
 	core.Config = c
 }
 
-// RestartActiveIndexOperations restarts all active index operations.
 func (c *Core) RestartActiveIndexOperations(ctx context.Context) {
 	ops, err := c.DB.GetActiveIndexOperations()
 	if err != nil {
@@ -232,7 +259,6 @@ func (c *Core) RestartActiveIndexOperations(ctx context.Context) {
 	}
 }
 
-// GetAdditionalCollectionCount returns the number of additional db urls provided.
 func (c *Core) GetAdditionalCollectionCount() int {
 	return c.additionalURLsCount
 }
@@ -248,18 +274,15 @@ func (c *Core) GetContext() context.Context {
 	return c.Ctx
 }
 
-// App returns the initialized global app instance.
 func Application() *Core {
 	return _app
 }
 
-// LogUpdate prints update information to debug log.
 func LogUpdate(bot *gotgbot.Bot, ctx *ext.Context) error {
 	_app.Log.Debug(fmt.Sprintf("received %s update (%d)", ctx.GetType(), ctx.UpdateId))
 	return nil
 }
 
-// containsI64 reports whether the given value is in a slice.
 func containsI64(s []int64, val int64) bool {
 	for _, i := range s {
 		if i == val {
